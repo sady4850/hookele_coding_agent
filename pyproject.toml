@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hookele"
+version = "0.0.1"
+description = "Hookele Harbor agent"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.55",
+    "python-dotenv>=1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["hookele*", "adapters*"]
