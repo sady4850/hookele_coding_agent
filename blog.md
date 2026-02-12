@@ -1,6 +1,6 @@
 # Building Hookele: An Autonomous Coding Agent for Terminal-Bench 2.0
 
-*How a coding agent evolved from an overengineered two-model state machine to ~2,200 lines of "let the LLM figure it out" and ended up beating the only other GPT-5.1 Codex Mini run on Terminal-Bench 2.0.*
+*+18 points over the baseline with the same model. Turns out the harness matters more than the model tier.*
 
 ---
 
@@ -10,7 +10,7 @@ I wanted to answer a simple question: **how far can careful harness design push 
 
 ## The Punchline
 
-Hookele only got better when I deleted things: no separate planner, no tool filtering, no acceptance criteria engine, no state machine. The final agent is one model, one loop, and a directory of skill files. It scores **61.1%** across all 89 Terminal-Bench 2.0 tasks (445 trials) with GPT-5.1 Codex Mini. For context, the only other codex-mini submission on the official leaderboard sits at **43.1%** ([source](https://www.tbench.ai/leaderboard/terminal-bench/2.0?models=GPT-5.1-Codex-Mini)). A full sweep cost **$27 in API spend** (sum of `final_metrics.total_cost_usd` across the 436 trajectory logs under `/Users/dmitrybarakhov/Projects/hookele/submit/hookele-gpt-5.1-codex-mini`) and took about **35.4 hours** end to end; running the same sweep with Codex Max would have been well north of $500.
+The final agent is one model, one loop, and a directory of skill files. **61.1%** across all 89 Terminal-Bench 2.0 tasks (445 trials) with GPT-5.1 Codex Mini — versus **43.1%** for the other codex-mini submission on the [official leaderboard](https://www.tbench.ai/leaderboard/terminal-bench/2.0?models=GPT-5.1-Codex-Mini). The full 5× sweep cost **$27** and took **35.4 hours**.
 
 The largest single win was a 100-token skill-classification call that decides which Markdown skill sheets to stuff into the system prompt. Everything else is support structure so that one loop can keep moving: stable streaming, tool output capping at 20K characters, fuzzy V4A patches, Harbor-aware retries.
 
@@ -120,14 +120,15 @@ Active skills get appended beneath those rules. The final two warnings ("5 steps
 - **Total:** 89 tasks × 5 runs each → **61.1%** accuracy.
 - **Perfect (5/5):** 46 tasks ranging from `kv-store-grpc` to `feal-differential-cryptanalysis` to `sanitize-git-repo`.
 - **Partial (1–5/5):** 16 tasks; e.g., `pytorch-model-cli` at 80%, `large-scale-text-editing` at 60%, `path-tracing` at 20%.
-- **Zeroes:** 27 tasks dominated by GPU/vision-heavy requirements (`torch-tensor-parallelism`, `sam-cell-seg`, `extract-moves-from-video`, `compile-compcert`, etc.).
+- **Zeroes:** 27 tasks dominated by GPU/vision-heavy requirements (`torch-tensor-parallelism`, `sam-cell-seg`, `extract-moves-from-video`) and tasks demanding deep multi-step reasoning (`compile-compcert`, `make-doom-for-mips`, `regex-chess`). Harness design can't compensate for everything — on tasks that require long chains of precise reasoning or debugging novel compilation targets, codex-mini hits a ceiling that no amount of skill injection will lift. A larger model would likely recover some of these.
 
 Full per-task results live on the [official leaderboard](https://www.tbench.ai/leaderboard/terminal-bench/2.0) and in the Hookele repo's run artifacts (JSONL trajectories + CSV summaries). Compared to the other codex-mini entry (43.1%), Hookele gained **+18 points** purely through loop design and skill injection.
 
 ## Cost & Time
 
-- **API spend:** $27 summed from `final_metrics.total_cost_usd` across the 436 trajectory logs in `/Users/dmitrybarakhov/Projects/hookele/submit/hookele-gpt-5.1-codex-mini`.
-- **Wall-clock:** ~35.4 hours for a 5× full-benchmark sweep (Harbor scheduler timestamps between the first and last task runs in that bundle).
+- **API spend:** $27 total, summed from `final_metrics.total_cost_usd` across 436 trajectory logs in the submission bundle. That's ~$0.06 per task-run on average.
+- **Wall-clock:** ~35.4 hours for a 5× full-benchmark sweep (first to last task run in the bundle).
+- **Per-task range:** simple tasks (e.g., `fix-git`) finish in under a minute and cost fractions of a cent; heavy tasks (`compile-compcert`, `qemu-alpine-ssh`) can burn 10+ minutes and $0.20+ each.
 
 ## Reproduce It Yourself
 
