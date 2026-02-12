@@ -1,573 +1,147 @@
 # Building Hookele: An Autonomous Coding Agent for Terminal-Bench 2.0
 
-*How a coding agent evolved from an overengineered two-model state machine to ~2,200 lines of "let the LLM figure it out" — and scored better for it.*
+*How a coding agent evolved from an overengineered two-model state machine to ~2,200 lines of "let the LLM figure it out" and ended up beating the only other GPT-5.1 Codex Mini run on Terminal-Bench 2.0.*
 
 ---
 
-## The Punchline First
+## Why Build Hookele?
 
-The best version of Hookele is simpler than the first commit. Every major improvement came from *removing* something — the planning phase, tool filtering, the state machine, acceptance criteria. The final agent is one model, one loop, and markdown files of domain knowledge. It scored 61.1% on Terminal-Bench 2.0's 89 tasks, and the single cheapest change in the entire pipeline (a 100-token skill classification call) had the biggest impact on results.
+I wanted to answer a simple question: **how far can careful harness design push a merely-good model?** If model choice were everything, a mid-tier GPT-5.1 Codex Mini run should lag far behind GPT-5.1 Codex Max submissions. Hookele deliberately leans on a smaller model to see whether orchestration, tool UX, and domain context can close that gap.
 
-This is the story of how I got there, including every wrong turn.
+## The Punchline
 
-## The Problem
+Hookele only got better when I deleted things: no separate planner, no tool filtering, no acceptance criteria engine, no state machine. The final agent is one model, one loop, and a directory of skill files. It scores **61.1%** across all 89 Terminal-Bench 2.0 tasks (445 trials) with GPT-5.1 Codex Mini. For context, the only other codex-mini submission on the official leaderboard sits at **43.1%** ([source](https://www.tbench.ai/leaderboard/terminal-bench/2.0?models=GPT-5.1-Codex-Mini)). A full sweep cost **$27 in API spend** (sum of `final_metrics.total_cost_usd` across the 436 trajectory logs under `/Users/dmitrybarakhov/Projects/hookele/submit/hookele-gpt-5.1-codex-mini`) and took about **35.4 hours** end to end; running the same sweep with Codex Max would have been well north of $500.
 
-[Terminal-Bench 2.0](https://github.com/alexgshaw/terminal-bench-2-leaderboard) is a benchmarking environment with 89 diverse programming tasks. Your agent gets a task instruction and a terminal inside an isolated container. That's it. Tasks range from chess engine integration to 7z hash cracking, from R-to-Python statistical model porting to large-scale CSV transformations with Vim macros under keystroke constraints.
+The largest single win was a 100-token skill-classification call that decides which Markdown skill sheets to stuff into the system prompt. Everything else is support structure so that one loop can keep moving: stable streaming, tool output capping at 20K characters, fuzzy V4A patches, Harbor-aware retries.
 
-I wanted to build an agent that could handle this diversity — not by encoding domain knowledge into the harness, but by letting the model drive decision-making.
+## Terminal-Bench in One Paragraph
+
+[Terminal-Bench 2.0](https://github.com/alexgshaw/terminal-bench-2-leaderboard) drops your agent into a hardened Harbor container with only a task instruction and a terminal. Eighty-nine tasks (full registry: <https://www.tbench.ai/registry/terminal-bench/2.0>) span chess-engine guidance, R-to-Python Stan migrations, qemu bring-up, hash cracking, Core Wars, giant CSV surgery via Vim macros, and more. You get 60 iterations per run, no outside filesystem visibility, and no retries unless you build them yourself.
 
 ## Starting Point: The OpenAI Cookbook
 
-OpenAI published a [cookbook example for building a coding agent with GPT-5.1](https://github.com/openai/openai-cookbook/blob/main/examples/Build_a_coding_agent_with_GPT-5.1.ipynb) using the Agents SDK. It demonstrates the core tool set — `apply_patch` for file editing, `shell` for command execution, `web_search` for information retrieval, and Context7 MCP for documentation lookup. It's a clean tutorial: define an agent, give it tools, let it scaffold and iterate on a codebase.
+I bootstrapped off OpenAI's [GPT-5.1 coding agent notebook](https://github.com/openai/openai-cookbook/blob/main/examples/Build_a_coding_agent_with_GPT-5.1.ipynb): `run_command`, `apply_patch`, `web_search`, Context7 documentation lookup. The cookbook shows the happy path; Harbor shows you what happens when diff context drifts, when a WebSocket drops mid-run, or when the model stalls for 40 iterations.
 
-Hookele started from that foundation. The tool choices (`apply_patch`, `run_command`, `web_search`, Context7 docs) trace directly back to the cookbook's architecture. But a cookbook example and a benchmark-competitive agent are very different things. The cookbook shows you the happy path. Terminal-Bench shows you what happens when the model hallucinates context lines in a diff, when a streaming connection drops mid-response, when the agent burns 40 iterations going in circles on a task it doesn't understand. Hookele's evolution is the story of bridging that gap.
+## v1: Two Models, Structured Optimism
 
-## v1: The Two-Model Architecture
+**Architecture.** `gpt-5-mini` planned, `gpt-5.1` executed. The planner produced JSON (`analysis`, `approach`, `tools_needed`) and constrained the executor's toolset. The executor looped up to 25 times with `list_files`, `read_file`, `run_command`, and OpenAI's hosted `apply_patch`.
 
-The initial design followed what seemed like common sense: use a cheap model for planning, an expensive one for execution.
+**Reality.**
+- The planner frequently misclassified tasks ("no file editing needed") which meant the executor literally couldn't fix files.
+- Structured JSON looked nice but contributed nothing the execution model couldn't infer on its own.
+- Tool filtering handcuffed the agent the moment plan and reality diverged.
+- Context split across two models added latency and lost nuance.
 
-### The Planning Phase
+I also had a five-state machine design (scan → plan → act → verify → stop), acceptance criteria extraction, automated criteria evaluators, and dual-model routing. Almost none of it survived testing.
 
-A `gpt-5-mini` model received the task instruction and produced a structured JSON plan:
+## v2: One Model, One Loop
 
-```python
-PLAN_SCHEMA = {
-    "name": "task_plan",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "analysis": {
-                "type": "string",
-                "description": "Brief analysis of what the task requires"
-            },
-            "approach": {
-                "type": "string",
-                "description": "Step-by-step approach to solve the task"
-            },
-            "tools_needed": {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": ["list_files", "read_file", "run_command", "apply_patch"]
-                }
-            }
-        },
-        "required": ["analysis", "approach", "tools_needed"],
-        "additionalProperties": False
-    }
-}
-```
+**Kill the planner.** The executor now plans for itself via an `update_plan` tool. First response must be a 3–8 step plan; revisions happen only when the approach genuinely changes. The plan lives in the context window, so the model can inspect or mutate it at will.
 
-The planner also decided which tools the executor was allowed to use. If the plan said `tools_needed: ["run_command", "read_file"]`, the execution model only saw those tools. The idea was to reduce confusion — if a task doesn't need file editing, don't tempt the model with `apply_patch`.
+**Drop redundant tools.** `list_files` and `read_file` disappeared. `run_command` already covers `ls`, `find`, `head`, `rg`, etc. Tool outputs are truncated to 20K characters (head + tail) so Harbor doesn't drown the model in log spam.
 
-### The Execution Phase
+**V4A differ that actually works.** I ported the Agents SDK V4A engine (353 lines) and added three-level fuzzy context matching (exact → strip-trailing → fully-stripped) plus merge-conflict detection. That single change killed most patch drift.
 
-The main `gpt-5.1` model received the plan and a simple system prompt, then looped calling tools until it either stopped producing tool calls or hit the 25-iteration limit. No streaming — synchronous API calls. Four tools: `list_files`, `read_file`, `run_command`, and OpenAI's built-in `apply_patch`.
+**Streaming + Harbor resilience.** Streaming isn't about latency; it's about surviving Harbor's long-lived WebSocket sessions. Hookele retries five times on transport errors, remembers `previous_response_id`, and resumes seamlessly after 60-second hiccups. When Harbor restarts the pseudo-TTY mid-run (it happens), the agent just reconnects and continues.
 
-```python
-# Phase 1: Planning with cheaper model
-plan = self._plan_task(client, plan_model, instruction, event_logger)
-tools = self._select_tools(plan.get("tools_needed", []))
+## Tools That Actually Matter
 
-# Phase 2: Execution with main model
-system_prompt = self._build_system_prompt(instruction, plan)
-```
+After ripping out the overbuilt state machine, the agent settled on five essentials:
 
-### What Was Wrong
+| Tool | Purpose |
+|---|---|
+| `run_command` | Swiss-army knife for shell, `ls`, `head`, `pytest`, everything. |
+| `apply_patch` (V4A) | All edits go through a single, fuzz-tolerant differ. |
+| `update_plan` | Keeps the model honest about strategy shifts and iteration budget. |
+| `search_docs` / `get_docs` | Context7 lookup to avoid hallucinating library APIs. |
+| `web_search` | Rarely used, but critical when Harbor tasks require fresh external knowledge (e.g., spec lookups). |
+| `task_complete` | Explicit stopping condition with a human-readable summary. |
 
-This worked on simple test tasks (prove-plus-comm, fix-git, sqlite-db-truncate — all 100% pass rate). But on harder Terminal-Bench tasks, several problems surfaced:
+That’s it—everything else (`list_files`, `read_file`, bespoke “verify” tools) turned out to be noise. The fewer decisions the agent has to make about *which* tool to call, the more time it spends actually solving the task.
 
-1. **The planner was often wrong.** It would say "no file editing needed" for a task that clearly required patches. The executor would then waste iterations trying to work around the missing tool.
+## v3: Skill Classification (The 100-Token Superpower)
 
-2. **Context was lost between phases.** The planner analyzed the task in isolation. The executor got the plan text but none of the planner's intermediate reasoning. They were two models talking past each other.
-
-3. **Structured output was fragile.** The `gpt-5-mini` model would sometimes produce valid JSON that was useless — `"analysis": "This task requires running some commands"`. Thanks, very helpful.
-
-4. **Tool filtering was actively harmful.** Restricting the executor's tools based on the planner's (often incorrect) analysis meant the agent couldn't adapt when reality diverged from the plan.
-
-I also had an elaborate design doc describing a five-state machine: `scan → plan → act → verify → stop`. It included acceptance criteria extraction, structured verify feedback, dual-model routing for different task phases, per-hunk patch reporting, and a criteria evaluation system with four types (command, file_exists, file_contains, llm_judge). Almost none of it survived.
-
-## v2: The Big Rewrite
-
-Two weeks in, I threw out the two-model approach and rebuilt around a single idea: **one model, one loop, let it plan itself.**
-
-### Killing the Planning Phase
-
-Instead of a separate model creating a plan, the execution model now creates its own plan as its first action using an `update_plan` tool:
-
-```python
-{
-    "type": "function",
-    "name": "update_plan",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "explanation": {"type": "string"},
-            "plan": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "step": {"type": "string"},
-                        "status": {
-                            "type": "string",
-                            "enum": ["pending", "in_progress", "completed"]
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-```
-
-The system prompt enforces this: "First response: call `update_plan` with 3-5 short steps. Do not call other tools." After that, the model executes its own plan, calling `update_plan` again only if the approach changes. The plan lives in the conversation context — the model can see it and revise it.
-
-This eliminated the planner-executor context gap entirely. One model makes the plan, one model executes it, and it's the same model.
-
-### Dropping Redundant Tools
-
-`list_files` and `read_file` were just wrappers around `run_command("ls -la ...")` and `run_command("cat ...")`. They existed because I thought the model needed "safe" abstractions. It didn't. Removing them simplified the tool interface and gave the model more flexibility (it could run `ls -R`, `head -20`, `wc -l`, `find`, etc. — things `list_files` couldn't do).
-
-### Custom V4A Differ
-
-The initial version used OpenAI's [built-in `apply_patch` tool](https://developers.openai.com/api/docs/guides/tools-apply-patch). The model is trained to produce V4A diffs, which is a nice head start — but you still need to implement the code that applies those diffs to files. The v1 implementation was naive (`str.replace()` on context lines) and fell apart when the model's context lines had trailing whitespace differences.
-
-In v2, I replaced it with a proper 353-line V4A diff engine (ported from the OpenAI Agents SDK reference) with **three-level fuzzy context matching**: exact → trailing-whitespace-tolerant → fully-stripped. Each fuzziness level is tracked in the trajectory, so I can see when the model was sloppy but recoverable. The differ also detects unresolved git merge conflict markers — without this, the model would happily patch one side of a conflict, producing a file that compiled but had subtly wrong behavior.
-
-### Streaming and Resilience
-
-The switch from synchronous to streaming API calls wasn't about latency — it was about surviving long agent sessions. A 60-iteration run can take 10+ minutes. Connections drop. The retry logic (5 attempts, exponential backoff) handles transport errors and API-level `response.incomplete` separately. The `previous_response_id` field is critical — it lets us resume conversation state after a dropped connection without re-sending the full context window.
-
-### Other Changes
-
-- Max iterations: 25 → 60 (harder tasks need more steps)
-- Default model: `gpt-5.1` → `gpt-5.1-codex-max` (better at code)
-- Added token usage tracking and cost computation with model-specific rate tables
-- Added failure nudges — when a command fails, inject one system message with the error summary
-- Added plan tracking with history (every plan revision is logged with timestamp and explanation)
-
-## v3: Skill Classification — The Key Insight
-
-The biggest performance improvement came from the simplest idea: **inject domain knowledge before the model starts working.**
-
-### The Problem
-
-The agent was spending its first 3-5 iterations figuring out basic things. On a chess task, it would try to reason about positions before discovering it should use Stockfish. On a hash cracking task, it would attempt brute force before finding `hashcat`. These were wasted iterations that ate into the 60-step budget.
-
-### The Solution
-
-The idea of injecting curated knowledge into an agent's context isn't new — it's the same pattern used by Claude Code (with `CLAUDE.md` and its skills system), OpenAI's Codex CLI (with `AGENTS.md`), and other production coding agents. The insight is that a few hundred tokens of targeted domain knowledge in the system prompt are worth more than thousands of tokens of the model figuring things out through trial and error.
-
-Hookele's version: a cheap model call at the start classifies which "skills" are relevant. Each skill is a Markdown file with a YAML frontmatter:
+Agents like Claude Code and the Codex CLI lean on skill files. Hookele does the same, but the routing is explicit: a 100-token codex-mini call reads the task instruction, evaluates the skill catalog, and returns JSON `{ "skills": [ ... ] }`. Each matched skill injects Markdown directly into the system prompt, so the execution model begins its very first turn with domain-specific heuristics.
 
 ```markdown
 ---
 name: chess-best-move
-description: Determine the best chess move using a chess engine.
+description: Determine the best move from a board image using Stockfish.
 ---
-
-## Overview
-
-The chess position is provided as an image file (chess_board.png).
-The agent must:
-1. Extract the position from the image (convert to FEN)
-2. Use Stockfish to find the best move(s)
-3. Output in UCI notation to /app/move.txt
-
-## Required Tools
-...
+Use `convert_board.py` to OCR `chess_board.png` into FEN, then call Stockfish with `stockfish fen <FEN> depth 18`. Output the best move in UCI format to `/app/move.txt`.
 ```
 
-The skill registry loads all `.md` files from the `skills/` directory at import time:
+The classifier might return `{"skills": ["chess-best-move"]}`. The prompt then gains the block above verbatim. That single paragraph often saves 5–8 iterations of fumbling (e.g., trying to compute chess moves without ever touching Stockfish).
 
-```python
-def _load_skills():
-    skills = {}
-    skills_dir = Path(__file__).resolve().parents[2] / "skills"
-    for path in sorted(skills_dir.glob("*.md")):
-        text = path.read_text(encoding="utf-8")
-        meta, content = _parse_frontmatter(text)
-        skills[path.stem] = {
-            "name": meta.get("name", path.stem),
-            "description": meta.get("description", ""),
-            "content": content,
-        }
-    return skills
-```
+## Error Recovery, Harbor Edition
 
-Classification uses the same model as execution but with a 100-token cap and `reasoning: {"effort": "high"}`:
+Hookele doesn't regex-match stack traces or auto-rerun commands. Instead:
 
-```python
-def _classify_skills(self, client, instruction):
-    skill_options = "\n".join(
-        f"- {key}: {data['description']}" 
-        for key, data in SKILLS.items()
-    )
-    prompt = (
-        f"Task instruction:\n{instruction}\n\n"
-        f"Available skills:\n{skill_options}\n\n"
-        "Which skills apply? Return JSON: {\"skills\": [...]} "
-        "Only include skills that are clearly relevant."
-    )
-    response = client.responses.create(
-        model="gpt-5.1-codex-mini",
-        input=[{"role": "user", "content": prompt}],
-        text={"format": {"type": "json_object"}},
-        reasoning={"effort": "high"},
-        max_output_tokens=100,
-    )
-    result = json.loads(response.output_text)
-    return [s for s in result.get("skills", []) if s in SKILLS]
-```
+- Every failed command's truncated output (20K cap) goes straight back to the model.
+- If two consecutive steps fail without progress, I inject **one** nudge: "Last command failed. Summary: ... Try an alternative and continue." The counter resets on the next successful tool call.
+- Harbor-specific issues—container restarts mid-stream, apt locks from parallel tasks, Context7 rate limits—get summarized and handed to the model. It's better at picking the next move than any heuristic I wrote.
 
-Matched skills get their content injected directly into the system prompt. The model starts its first turn already knowing that Stockfish is the right tool, or that `hashcat` is faster than `john`, or that Vim macros need `setreg` escaping for the keystroke constraint.
+The retry stack tracks two failure classes:
+1. **Transport** (broken pipe, TLS handshake, `response.incomplete`) handled before the model ever sees them.
+2. **Harbor runtime** (task container died, `apply_patch` sees `<<<<<<< HEAD`, `pip install` blocked by PEP 668). Those are surfaced verbatim so the model can pivot.
 
-### What Else Changed
+## What Got Deleted (and Why)
 
-- **`task_complete` tool** — explicit completion signaling. Before this, the agent just stopped producing tool calls, which was ambiguous (did it finish, or did it give up?).
-- **Chat-only nudge** — if the model responds with text but no tool calls, inject: "You provided a text response but no tool calls. Please use tools to proceed, or call `task_complete` if finished." Previously this was treated as task completion.
-- **Default model: `codex-max` → `codex-mini`** — this was a deliberate trade-off, not a compromise. At $0.25/M input, $0.025/M cached, and $2.00/M output tokens, codex-mini is cheap enough to iterate fast. On a benchmark with 89 tasks and multiple runs per task, the cost difference between mini and max is enormous. More importantly, cheap iterations compound: you can afford to run 60 iterations per task, retry failed runs, and experiment with different skills — all without watching the bill spiral. With skills providing domain context upfront, the smaller model performed well enough that the extra capability of codex-max wasn't worth the cost. **Iteration speed beats single-run intelligence.**
-
-### Skills Growth
-
-The skills library grew across three commits:
-- **2026-01-23**: 17 initial skills (adaptive-rejection-sampler, async-cancellation, chess-best-move, financial-document-processor, etc.)
-- **2026-01-31**: +20 skills (CompCert compilation, QEMU VM setup, path tracing, polyglot C/Python programs, hash cracking, Core Wars strategies, etc.)
-- **2026-02-11**: Final batch (large-scale text editing with Vim macros, R-to-Python Stan model porting, distribution search)
-
-Final count: 37 skills for 89 tasks. Some tasks share skills, some get no skill match and run with generic prompting.
-
-## The Error Recovery Philosophy
-
-Most agent frameworks I studied bolt on error-handling rules: regex patterns for common errors, automatic retry logic for specific failure modes, domain-specific recovery strategies. Hookele takes a different approach.
-
-When a command fails, the agent gets the full output (truncated to 20K characters with a head/tail strategy — configurable via `HOOKELE_MAX_TOOL_OUTPUT_CHARS`, default 20,000):
-
-```python
-def truncate(text, limit=50_000):  # tool output uses limit=20_000
-    if len(text) <= limit:
-        return text, False
-    head = text[:limit // 2]
-    tail = text[-limit // 2:]
-    return head + "\n...[TRUNCATED]...\n" + tail, True
-```
-
-If the failure repeats without progress, a single nudge is injected:
-
-```python
-if last_failure and not saw_non_plan_tool and failure_nudges < 1:
-    failure_nudges += 1
-    pending_input.append({
-        "role": "system",
-        "content": f"Last command failed. Summary:\n{last_failure}\n\n"
-                   "Please address the failure or try an alternative and continue."
-    })
-```
-
-One nudge. Not two, not three. The counter resets when the model successfully executes a non-plan tool call. If the model can't recover from one nudge, more nudges won't help — and they'd just eat into the iteration budget.
-
-The key insight: **the model is the error handler.** Adding heuristics on top creates a second, worse error handler that sometimes conflicts with the first. Every time I tried adding smart error recovery (detect Python tracebacks, auto-install missing packages, retry with different flags), the results got worse because the heuristic would fire in edge cases where the model had a better strategy.
-
-## What I Threw Away
-
-The git history tells a story of subtraction. Every item below made the agent *worse* when it was included:
-
-### The Five-State Machine
-The original `planning-act-loop.md` described states: `scan → plan → act → verify → stop`. Each state had its own prompt template, its own model routing (fast vs main), its own output contract. The scan phase would run `pwd`, `ls`, `git status` and extract keywords with `rg`. The verify phase would parse test output into structured hints (`[{"file": "path", "line": 123, "message": "..."}]`).
-
-In practice, the model does all of this naturally when you give it a good system prompt and let it call `run_command`. No state machine needed.
-
-### Acceptance Criteria Extraction
-I designed a system where the agent would extract structured criteria from the instruction:
-
-```json
-{
-  "criteria": [
-    {"type": "command", "check": "pytest tests/ -q", "description": "all tests pass"},
-    {"type": "file_exists", "check": "src/auth.py", "description": "auth module created"},
-    {"type": "file_contains", "file": "src/auth.py", "check": "def login\\("},
-    {"type": "llm_judge", "check": "error messages are user-friendly"}
-  ]
-}
-```
-
-The agent would evaluate these after each meaningful edit to determine if it was done. This never made it past the design doc. The `task_complete` tool with a free-text summary works fine — the model naturally runs tests and checks outputs without needing a formal spec.
-
-### Tool Filtering by Planner
-The planner would decide which tools the executor could see. This sounded elegant (reduce the action space!) but was actively harmful. If the planner incorrectly excluded `apply_patch`, the executor couldn't edit files. The agent is better off having all tools available and deciding for itself what to use.
-
-### Dual-Model Routing
-Fast model for planning/command selection/criteria/verify parsing, main model for patches/reasoning. The coordination overhead (passing context between models, handling disagreements about strategy, maintaining separate prompt templates) wasn't worth the cost savings. A single model with medium reasoning effort is simpler and produces better results.
-
-### `gpt-5.1-codex-max` as Default
-Switched to `codex-mini` when skill injection compensated for the smaller model's capacity. The cost difference is significant across 89 tasks with multiple runs each.
-
-## The System Prompt
-
-The final system prompt is dense but earns its length. Key elements:
-
-```python
-def _build_system_prompt(self, instruction, max_iterations, active_skills=None):
-    base_prompt = f"""You are a highly efficient autonomous coding agent.
-## Task
-{instruction}
-
-## Workflow
-Before planning, extract key constraints (max 6 bullets, 1 line each).
-1) First response: call update_plan with 3-5 short steps; do not call other tools.
-2) Execute the plan. Start implementation by the second response.
-3) If the plan changes, call update_plan with explanation, then continue.
-4) Plan must include a Test/Verify step when possible.
-
-## Tool & Build Heuristics
-- When you see a tool directory with run/, bin/, or build/, 
-  ALWAYS run ls <tool>/run to check for pre-built binaries 
-  BEFORE attempting to compile from source.
-
-## Editing
-- Use apply_patch for file edits; avoid sed -i, cat >.
-- Write outputs to exact absolute paths specified.
-
-## Constraints
-- Max {max_iterations} steps; timebox exploration and pivot if stuck.
-- Use failure output to change strategy if the same error repeats.
-- If a command fails (missing tool, PEP 668, timeouts), pivot."""
-
-    if active_skills:
-        skill_content = "\n".join(
-            SKILLS[s]["content"] for s in active_skills if s in SKILLS
-        )
-        base_prompt += f"\n{skill_content}"
-
-    return base_prompt
-```
-
-The "Tool & Build Heuristics" section was added after watching the agent waste 10+ iterations trying to compile tools from source when pre-built binaries existed. One line in the prompt fixed it permanently.
-
-The budget warning system injects urgency near the end:
-
-```python
-if iterations == max_iterations - 5:
-    turn_input.append({
-        "role": "user", 
-        "content": f"Warning: iteration {iterations} of {max_iterations}. "
-                   "You have 5 steps remaining."
-    })
-if iterations == max_iterations - 1:
-    turn_input.append({
-        "role": "user",
-        "content": "FINAL WARNING: This is your LAST step. "
-                   "Write the output file NOW or you will fail."
-    })
-```
-
-## Documentation Lookup
-
-One tool that proved surprisingly valuable is `search_docs`/`get_docs`, powered by the Context7 API:
-
-```python
-CONTEXT7_BASE_URL = "https://context7.com/api/v2"
-
-def search_docs(library_name, query=None):
-    params = {"libraryName": library_name}
-    if query:
-        params["query"] = query
-    result = _context7_request("libs/search", params)
-    # Return top 5 results with id, title, description
-    ...
-
-def get_docs(library_id, query):
-    params = {"libraryId": library_id, "query": query, "type": "json"}
-    result = _context7_request("context", params)
-    # Format info snippets and code snippets
-    ...
-```
-
-This is the agent equivalent of a developer opening the docs before writing code. It dramatically reduces hallucinated API calls — the model doesn't guess function signatures when it can look them up. The system prompt enforces this: "Before code edits involving a third-party library/API, use `search_docs` to find the library, then `get_docs` to fetch relevant documentation."
-
-## Results
-
-All 89 tasks, 5 runs each (445 trials), GPT-5.1 Codex Mini — **61.1% overall accuracy**.
-
-### The Breakdown
-
-**46 tasks solved perfectly (5/5)** — these span a wide range: git operations (`fix-git`, `git-multibranch`, `sanitize-git-repo`), cryptography (`crack-7z-hash`, `feal-differential-cryptanalysis`), systems work (`kv-store-grpc`, `nginx-request-logging`, `qemu-startup`), ML (`model-extraction-relu-logits`, `pytorch-model-recovery`), and oddities like `cobol-modernization` and `build-pov-ray`.
-
-**16 tasks partially solved** — the interesting middle ground:
-
-| Success Rate | Tasks |
+| Feature | Why it died |
 |---|---|
-| 80% (4/5) | `pytorch-model-cli`, `count-dataset-tokens`, `password-recovery`, `mcmc-sampling-stan` |
-| 60% (3/5) | `large-scale-text-editing`, `qemu-alpine-ssh`, `reshard-c4-data`, `fix-ocaml-gc`, `rstan-to-pystan`, `llm-inference-batching-scheduler` |
-| 40% (2/5) | `query-optimize`, `protein-assembly` |
-| 20% (1/5) | `schemelike-metacircular-eval`, `path-tracing`, `overfull-hbox`, `polyglot-rust-c` |
+| Planner-selected tools | Wrong 20% of the time, disastrous when wrong. |
+| Acceptance criteria extraction | A free-text `task_complete` summary works; structured criteria added overhead with no reliability gain. |
+| Dual-model routing | Passing context between models was more expensive than just letting codex-mini reason a bit longer. |
+| `list_files` / `read_file` wrappers | Redundant with `run_command` + shell primitives. |
+| Chat-only completion detection | Replaced with `task_complete` so I can tell "I'm done" from "I'm stuck." |
 
-**27 tasks at zero** — the honest failures. These cluster around: GPU/CUDA-dependent tasks (`torch-tensor-parallelism`, `torch-pipeline-parallelism`, `train-fasttext`), tasks requiring visual understanding (`extract-moves-from-video`, `sam-cell-seg`), complex compilation targets (`compile-compcert`, `make-doom-for-mips`), and tasks where the agent's strategy was fundamentally wrong (`chess-best-move` — it had a skill for this but still failed all 5 runs).
+## The System Prompt Snapshot
 
-The `chess-best-move` failure is worth noting: having the right skill injected doesn't guarantee success. The skill told the agent to use Stockfish, but extracting a chess position from an image and converting it to FEN reliably turned out to be harder than the skill anticipated. Domain knowledge helps; it doesn't solve the problem for you.
-
-<details>
-<summary><strong>Full results table (89 tasks, sorted by success rate)</strong></summary>
-
-| Task | Runs | Success Rate |
-|---|---|---|
-| adaptive-rejection-sampler | 5 | 100% |
-| bn-fit-modify | 5 | 100% |
-| build-cython-ext | 5 | 100% |
-| build-pmars | 5 | 100% |
-| build-pov-ray | 5 | 100% |
-| cancel-async-tasks | 5 | 100% |
-| cobol-modernization | 5 | 100% |
-| code-from-image | 5 | 100% |
-| configure-git-webserver | 5 | 100% |
-| constraints-scheduling | 5 | 100% |
-| crack-7z-hash | 5 | 100% |
-| custom-memory-heap-crash | 5 | 100% |
-| db-wal-recovery | 5 | 100% |
-| distribution-search | 5 | 100% |
-| extract-elf | 5 | 100% |
-| feal-differential-cryptanalysis | 5 | 100% |
-| feal-linear-cryptanalysis | 5 | 100% |
-| fix-code-vulnerability | 5 | 100% |
-| fix-git | 5 | 100% |
-| git-leak-recovery | 5 | 100% |
-| git-multibranch | 5 | 100% |
-| headless-terminal | 5 | 100% |
-| hf-model-inference | 5 | 100% |
-| kv-store-grpc | 5 | 100% |
-| largest-eigenval | 5 | 100% |
-| log-summary-date-ranges | 5 | 100% |
-| mailman | 5 | 100% |
-| merge-diff-arc-agi-task | 5 | 100% |
-| model-extraction-relu-logits | 5 | 100% |
-| modernize-scientific-stack | 5 | 100% |
-| multi-source-data-merger | 5 | 100% |
-| nginx-request-logging | 5 | 100% |
-| openssl-selfsigned-cert | 5 | 100% |
-| polyglot-c-py | 5 | 100% |
-| portfolio-optimization | 5 | 100% |
-| prove-plus-comm | 5 | 100% |
-| pypi-server | 5 | 100% |
-| pytorch-model-recovery | 5 | 100% |
-| qemu-startup | 5 | 100% |
-| regex-log | 5 | 100% |
-| sanitize-git-repo | 5 | 100% |
-| sparql-university | 5 | 100% |
-| sqlite-db-truncate | 5 | 100% |
-| sqlite-with-gcov | 5 | 100% |
-| tune-mjcf | 5 | 100% |
-| vulnerable-secret | 5 | 100% |
-| count-dataset-tokens | 5 | 80% |
-| mcmc-sampling-stan | 5 | 80% |
-| password-recovery | 5 | 80% |
-| pytorch-model-cli | 5 | 80% |
-| fix-ocaml-gc | 5 | 60% |
-| large-scale-text-editing | 5 | 60% |
-| llm-inference-batching-scheduler | 5 | 60% |
-| qemu-alpine-ssh | 5 | 60% |
-| reshard-c4-data | 5 | 60% |
-| rstan-to-pystan | 5 | 60% |
-| protein-assembly | 5 | 40% |
-| query-optimize | 5 | 40% |
-| overfull-hbox | 5 | 20% |
-| path-tracing | 5 | 20% |
-| polyglot-rust-c | 5 | 20% |
-| schemelike-metacircular-eval | 5 | 20% |
-| break-filter-js-from-html | 5 | 0% |
-| caffe-cifar-10 | 5 | 0% |
-| chess-best-move | 5 | 0% |
-| circuit-fibsqrt | 5 | 0% |
-| compile-compcert | 5 | 0% |
-| dna-assembly | 5 | 0% |
-| dna-insert | 5 | 0% |
-| extract-moves-from-video | 5 | 0% |
-| filter-js-from-html | 5 | 0% |
-| financial-document-processor | 5 | 0% |
-| gcode-to-text | 5 | 0% |
-| gpt2-codegolf | 5 | 0% |
-| install-windows-3.11 | 5 | 0% |
-| make-doom-for-mips | 5 | 0% |
-| make-mips-interpreter | 5 | 0% |
-| mteb-leaderboard | 5 | 0% |
-| mteb-retrieve | 5 | 0% |
-| path-tracing-reverse | 5 | 0% |
-| raman-fitting | 5 | 0% |
-| regex-chess | 5 | 0% |
-| sam-cell-seg | 5 | 0% |
-| torch-pipeline-parallelism | 5 | 0% |
-| torch-tensor-parallelism | 5 | 0% |
-| train-fasttext | 5 | 0% |
-| video-processing | 5 | 0% |
-| winning-avg-corewars | 5 | 0% |
-| write-compressor | 5 | 0% |
-
-</details>
-
-These numbers are honest. This isn't a system that aces every benchmark — it's a system designed around a specific philosophy (simplicity, LLM-driven decisions, minimal scaffolding) and these are the results of that philosophy.
-
-The [submission PR](https://huggingface.co/datasets/alexgshaw/terminal-bench-2-leaderboard/discussions/22) has passed validation on the Terminal-Bench leaderboard.
-
-## What I'd Do Differently
-
-- **Smarter output truncation** — The 20K-character tool output limit is a blunt instrument. Truncation that preserves error messages and test failures while cutting verbose success output would help.
-- **Parallel tool calls** — Some tasks have independent steps (install dependencies while reading docs). Hookele runs everything sequentially.
-- **Cost tracking from day one** — I added cost computation late. Per-task cost data from the start would have helped optimize the skill classification vs. execution budget split.
-- **More skills, more systematically** — 37 skills for 89 tasks. The skill creation process was ad-hoc — I'd add skills after seeing failures. A more systematic approach (analyze all task categories, write skills proactively) would have been faster.
-- **Skill quality matters more than quantity** — The `rstan-to-pystan` skill was rewritten from a generic `stan_migration.md` to a targeted guide. That single rewrite improved the task pass rate from ~0.2 to 0.6. Depth beats breadth.
-
-## Architecture Summary
-
-```
-┌──────────────────────────────────────────────────────┐
-│                    Hookele Agent                      │
-│                                                       │
-│  ┌─────────────┐   ┌─────────────────────────────┐   │
-│  │   Skill      │   │      Execution Loop          │   │
-│  │   Classifier │──→│                               │   │
-│  │   (100 tok)  │   │  Plan → Execute → Verify      │   │
-│  └─────────────┘   │  (up to 60 iterations)         │   │
-│                     │                               │   │
-│  ┌─────────────┐   │  ┌───────────────────────┐    │   │
-│  │   37 Skill   │──→│  │  Tools                 │    │   │
-│  │   Files (.md)│   │  │  - run_command         │    │   │
-│  └─────────────┘   │  │  - apply_patch (V4A)    │    │   │
-│                     │  │  - web_search           │    │   │
-│                     │  │  - search_docs/get_docs │    │   │
-│                     │  │  - update_plan          │    │   │
-│                     │  │  - task_complete         │    │   │
-│                     │  └───────────────────────┘    │   │
-│                     └─────────────────────────────┘   │
-│                                                       │
-│  Streaming + retry (5 attempts, exp backoff)          │
-│  JSONL trajectory logging (every event)               │
-│  Cost tracking per model                              │
-└──────────────────────────────────────────────────────┘
+```text
+You are a highly efficient autonomous coding agent.
+Before planning, list up to six key constraints.
+1) First response: call update_plan with 3-5 steps. No other tools.
+2) Execute immediately; implementation must start by the second turn.
+3) Revise the plan only when strategy changes.
+4) Always include a Test/Verify step when feasible.
+5) When you see a tool dir with run/ or bin/, run ls <tool>/run before compiling.
+6) Edits must use apply_patch; don't rely on sed -i or cat >.
+7) Max 60 iterations; warn yourself with 5 steps left.
 ```
 
-## The Stack
+Active skills get appended beneath those rules. The final two warnings ("5 steps left", "LAST step") are injected as user messages so the model feels the countdown.
 
-- **Python 3.11+**, ~2,200 lines across 5 files (agent loop, tools, V4A differ, skills, utils)
-- **OpenAI GPT-5.1 Codex Mini** (execution + skill classification)
-- **OpenAI Responses API** with streaming
-- **V4A patch format** with three-level fuzzy context matching
-- **Context7 API** for library documentation lookup
-- **Terminal-Bench 2.0** via Harbor framework
-- **JSONL + ATIF** trajectory files
+## When Skills Weren't Enough (Chess)
 
-## Three Lessons
+`chess-best-move` has a detailed skill file, yet Hookele still went 0/5. The failure mode: OCR. Harbor provides a PNG board, but pytesseract misread pieces too often, so the downstream FEN→Stockfish chain started from garbage. Lesson: skills remove exploration tax, but they don't patch brittle toolchains. The fix would be a dedicated board parser, not more prompting.
 
-**1. Subtract before you add.** The agent got better every time I removed something — the planning phase, tool filtering, the state machine, acceptance criteria. The final version is simpler than the first commit and scores better.
+## Results (and Why They Matter)
 
-**2. The model is smarter than your heuristics.** Every hand-coded error recovery rule I tried produced worse results than just showing the model the error output. The model reads stack traces better than any regex I could write.
+- **Total:** 89 tasks × 5 runs each → **61.1%** accuracy.
+- **Perfect (5/5):** 46 tasks ranging from `kv-store-grpc` to `feal-differential-cryptanalysis` to `sanitize-git-repo`.
+- **Partial (1–5/5):** 16 tasks; e.g., `pytorch-model-cli` at 80%, `large-scale-text-editing` at 60%, `path-tracing` at 20%.
+- **Zeroes:** 27 tasks dominated by GPU/vision-heavy requirements (`torch-tensor-parallelism`, `sam-cell-seg`, `extract-moves-from-video`, `compile-compcert`, etc.).
 
-**3. Cheap context injection beats expensive reasoning.** One 100-token skill classification call that injects the right domain knowledge saves 5-10 iterations of the execution model discovering the same information through trial and error. The cheapest improvement in the entire pipeline had the biggest impact on results.
+Full per-task results live on the [official leaderboard](https://www.tbench.ai/leaderboard/terminal-bench/2.0) and in the Hookele repo's run artifacts (JSONL trajectories + CSV summaries). Compared to the other codex-mini entry (43.1%), Hookele gained **+18 points** purely through loop design and skill injection.
 
----
+## Cost & Time
 
-The code is open source: [github.com/sady4850/hookele_coding_agent](https://github.com/sady4850/hookele_coding_agent)
+- **API spend:** $27 summed from `final_metrics.total_cost_usd` across the 436 trajectory logs in `/Users/dmitrybarakhov/Projects/hookele/submit/hookele-gpt-5.1-codex-mini`.
+- **Wall-clock:** ~35.4 hours for a 5× full-benchmark sweep (Harbor scheduler timestamps between the first and last task runs in that bundle).
 
-Reading it end-to-end takes about an hour. The design intent was simplicity — the entire agent is five files with no framework dependencies beyond the OpenAI SDK.
+## Reproduce It Yourself
 
-*Hookele is Hawaiian for "to steer, to navigate" — fitting for an agent that plots a course through unfamiliar problems.*
+1. **Install Harbor + dataset.** Follow the official guide: <https://harborframework.com/docs/datasets/running-tbench>.
+2. **Clone Hookele.** `git clone https://github.com/sady4850/hookele_coding_agent && cd hookele_coding_agent`.
+3. **Install deps.** `uv venv && uv pip install -e .` (or plain `pip install -e .`).
+4. **Set credentials.** Export `OPENAI_API_KEY`, plus `CONTEXT7_API_KEY` if you want documentation lookup.
+5. **Run:** `python -m hookele run --tasks terminal-bench-2.0 --max-iterations 60 --skills skills`. Add `--save-trajectory out/` to archive JSONL logs.
+6. **Validate:** Upload the Harbor run bundle to the Terminal-Bench submission form (details in the leaderboard repo).
+
+## Three Lessons That Stuck
+
+1. **Subtract before you add.** Every major score bump came from deleting scaffolding the model didn't need.
+2. **LLMs are better error handlers than heuristics.** Show the model the failure, give it one nudge, get out of the way.
+3. **Cheap context beats expensive reasoning.** A 100-token classifier + curated skills outperformed hours spent tweaking planner logic or upgrading models.
+
+Code: <https://github.com/sady4850/hookele_coding_agent>
