@@ -16,7 +16,7 @@ The largest single win was a 100-token skill-classification call that decides wh
 
 ## Terminal-Bench in One Paragraph
 
-[Terminal-Bench 2.0](https://github.com/alexgshaw/terminal-bench-2-leaderboard) drops your agent into a hardened Harbor container with only a task instruction and a terminal. Eighty-nine tasks (full registry: <https://www.tbench.ai/registry/terminal-bench/2.0>) span chess-engine guidance, R-to-Python Stan migrations, qemu bring-up, hash cracking, Core Wars, giant CSV surgery via Vim macros, and more. You get 60 iterations per run, no outside filesystem visibility, and no retries unless you build them yourself.
+[Terminal-Bench 2.0](https://github.com/alexgshaw/terminal-bench-2-leaderboard) drops your agent into a hardened Harbor container with only a task instruction and a terminal. Eighty-nine tasks (full registry: <https://www.tbench.ai/registry/terminal-bench/2.0>) span chess-engine guidance, R-to-Python Stan migrations, qemu bring-up, hash cracking, Core Wars, giant CSV surgery via Vim macros, and more. Harbor doesn’t hand you an iteration cap; Hookele enforces its own via the `HOOKELE_MAX_ITERATIONS` env var (default 60) while still giving you no outside filesystem visibility and no retries unless you build them yourself.
 
 ## Starting Point: The OpenAI Cookbook
 
@@ -106,10 +106,10 @@ Before planning, list up to six key constraints.
 4) Always include a Test/Verify step when feasible.
 5) When you see a tool dir with run/ or bin/, run ls <tool>/run before compiling.
 6) Edits must use apply_patch; don't rely on sed -i or cat >.
-7) Max 60 iterations; warn yourself with 5 steps left.
+7) Max HOOKELE_MAX_ITERATIONS iterations (default 60); warn yourself with 5 steps left.
 ```
 
-Active skills get appended beneath those rules. The final two warnings ("5 steps left", "LAST step") are injected as user messages so the model feels the countdown.
+Active skills get appended beneath those rules. Line 7 is templated with whatever `max_iterations` value the harness passes in (pulled from `HOOKELE_MAX_ITERATIONS`, default 60), and the final two warnings ("5 steps left", "LAST step") are injected as user messages so the model feels the countdown.
 
 ## When Skills Weren't Enough (Chess)
 
@@ -136,7 +136,7 @@ Full per-task results live on the [official leaderboard](https://www.tbench.ai/l
 2. **Clone Hookele.** `git clone https://github.com/sady4850/hookele_coding_agent && cd hookele_coding_agent`.
 3. **Install deps.** `uv venv && uv pip install -e .` (or plain `pip install -e .`).
 4. **Set credentials.** Export `OPENAI_API_KEY`, plus `CONTEXT7_API_KEY` if you want documentation lookup.
-5. **Run:** `python -m hookele run --tasks terminal-bench-2.0 --max-iterations 60 --skills skills`. Add `--save-trajectory out/` to archive JSONL logs.
+5. **Run:** `python -m hookele run --tasks terminal-bench-2.0 --max-iterations 60 --skills skills`. Add `--save-trajectory out/` to archive JSONL logs. That `--max-iterations` flag simply sets `HOOKELE_MAX_ITERATIONS`, so change 60 to whatever cap you want and the system prompt countdown stays in sync.
 6. **Validate:** Upload the Harbor run bundle to the Terminal-Bench submission form (details in the leaderboard repo).
 
 ## Three Lessons That Stuck

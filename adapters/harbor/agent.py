@@ -984,7 +984,7 @@ Before code edits involving a third-party library/API, use search_docs to find t
 - Exit code 0 without correct output is failure; run tests or verify expected behavior.
 
 ## Constraints
-- Max {max_iterations} steps; timebox exploration and pivot if stuck.
+- Max {max_iterations} steps (`HOOKELE_MAX_ITERATIONS`); warn yourself with 5 steps left and pivot sooner if stuck.
 - Use failure output to change strategy if the same error repeats.
 - Batch tool calls and avoid repeating identical commands.
 - Use /tmp for scratch; do not create or modify /tests unless instructed.
