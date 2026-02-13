@@ -36,7 +36,7 @@ I also had a five-state machine design (scan → plan → act → verify → sto
 
 ## v2: One Model, One Loop
 
-**Kill the planner.** The executor now plans for itself via an `update_plan` tool. First response must be a 3–8 step plan; revisions happen only when the approach genuinely changes. The plan lives in the context window, so the model can inspect or mutate it at will.
+**Kill the planner.** The executor now plans for itself via an `update_plan` tool. First response must be a 3–5 step plan; revisions happen only when the approach genuinely changes. The plan lives in the context window, so the model can inspect or mutate it at will.
 
 **Drop redundant tools.** `list_files` and `read_file` disappeared. `run_command` already covers `ls`, `find`, `head`, `rg`, etc. Tool outputs are truncated to 20K characters (head + tail) so Harbor doesn't drown the model in log spam.
 
@@ -46,7 +46,7 @@ I also had a five-state machine design (scan → plan → act → verify → sto
 
 ## Tools That Actually Matter
 
-After ripping out the overbuilt state machine, the agent settled on five essentials:
+After ripping out the overbuilt state machine, the agent settled on six essentials:
 
 | Tool | Purpose |
 |---|---|
@@ -65,20 +65,20 @@ Agents like Claude Code and the Codex CLI lean on skill files. Hookele does the 
 
 ```markdown
 ---
-name: chess-best-move
-description: Determine the best move from a board image using Stockfish.
+name: crack-7z-hash
+description: Guidance for cracking password-protected 7z archives.
 ---
-Use `convert_board.py` to OCR `chess_board.png` into FEN, then call Stockfish with `stockfish fen <FEN> depth 18`. Output the best move in UCI format to `/app/move.txt`.
+Extract a hash (`7z2john target.7z > hash.txt`), crack it (e.g., `hashcat -m 11600 -a 0 hash.txt wordlist.txt`), then verify by extracting the archive with the recovered password.
 ```
 
-The classifier might return `{"skills": ["chess-best-move"]}`. The prompt then gains the block above verbatim. That single paragraph often saves 5–8 iterations of fumbling (e.g., trying to compute chess moves without ever touching Stockfish).
+The classifier might return `{"skills": ["crack-7z-hash"]}`. The system prompt then gains the matched skill content verbatim (the markdown body of the file). That single paragraph often saves 5–8 iterations of fumbling (e.g., trying to brute-force an archive password before ever reaching for hashcat/john).
 
 ## Error Recovery, Harbor Edition
 
 Hookele doesn't regex-match stack traces or auto-rerun commands. Instead:
 
 - Every failed command's truncated output (20K cap) goes straight back to the model.
-- If two consecutive steps fail without progress, I inject **one** nudge: "Last command failed. Summary: ... Try an alternative and continue." The counter resets on the next successful tool call.
+- After a tool failure, if the model stalls (e.g., produces only planning/text instead of a productive non-plan tool call), I inject **one** nudge: "Last command failed. Summary: ... Try an alternative and continue." The counter resets after the next successful non-plan tool call.
 - Harbor-specific issues—container restarts mid-stream, apt locks from parallel tasks, Context7 rate limits—get summarized and handed to the model. It's better at picking the next move than any heuristic I wrote.
 
 The retry stack tracks two failure classes:
@@ -111,9 +111,9 @@ Before planning, list up to six key constraints.
 
 Active skills get appended beneath those rules. Line 7 is templated with whatever `max_iterations` value the harness passes in (pulled from `HOOKELE_MAX_ITERATIONS`, default 60), and the final two warnings ("5 steps left", "LAST step") are injected as user messages so the model feels the countdown.
 
-## When Skills Weren't Enough (Chess)
+## When Skills Aren’t Enough
 
-`chess-best-move` has a detailed skill file, yet Hookele still went 0/5. The failure mode: OCR. Harbor provides a PNG board, but pytesseract misread pieces too often, so the downstream FEN→Stockfish chain started from garbage. Lesson: skills remove exploration tax, but they don't patch brittle toolchains. The fix would be a dedicated board parser, not more prompting.
+Skills remove *exploration tax*, not capability limits. If a task fundamentally depends on GPU/CUDA, reliable OCR/vision, or deep multi-hour debugging, the harness can only do so much: you can make the loop stable and the tools ergonomic, but you can’t prompt your way into missing capabilities.
 
 ## Results (and Why They Matter)
 
@@ -134,10 +134,22 @@ Full per-task results live on the [official leaderboard](https://www.tbench.ai/l
 
 1. **Install Harbor + dataset.** Follow the official guide: <https://harborframework.com/docs/datasets/running-tbench>.
 2. **Clone Hookele.** `git clone https://github.com/sady4850/hookele_coding_agent && cd hookele_coding_agent`.
-3. **Install deps.** `uv venv && uv pip install -e .` (or plain `pip install -e .`).
+3. **Install deps (in the same env you run Harbor with).** `uv venv && uv pip install -e .` (or plain `pip install -e .`).
 4. **Set credentials.** Export `OPENAI_API_KEY`, plus `CONTEXT7_API_KEY` if you want documentation lookup.
-5. **Run:** `python -m hookele run --tasks terminal-bench-2.0 --max-iterations 60 --skills skills`. Add `--save-trajectory out/` to archive JSONL logs. That `--max-iterations` flag simply sets `HOOKELE_MAX_ITERATIONS`, so change 60 to whatever cap you want and the system prompt countdown stays in sync.
-6. **Validate:** Upload the Harbor run bundle to the Terminal-Bench submission form (details in the leaderboard repo).
+5. **Run a task via Harbor** (the agent entrypoint is the Harbor adapter):
+
+   ```bash
+   export HOOKELE_MAX_ITERATIONS=60  # change as desired
+   ~/.local/bin/harbor run \
+     -d terminal-bench@2.0 \
+     -t <task-name> \
+     --agent-import-path "adapters.harbor.agent:HookeleAgent" \
+     --jobs-dir ./jobs \
+     --debug
+   ```
+
+6. **Validate/submit.** Use Harbor’s produced job artifacts / bundle for the Terminal-Bench submission flow.
+
 
 ## Three Lessons That Stuck
 
